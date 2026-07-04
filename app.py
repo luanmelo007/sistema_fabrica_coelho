@@ -23,6 +23,40 @@ SCOPES = [
     "https://www.googleapis.com/auth/drive.readonly",
 ]
 
+# Ações recomendadas de manutenção/engenharia industrial por motivo de parada.
+# Baseado em práticas usuais de TPM (Total Productive Maintenance) e Lean.
+MOTIVO_ACOES = {
+    "Falha elétrica": (
+        "Revisar o plano de manutenção preventiva elétrica (contatores, sensores, "
+        "cabeamento) e avaliar manutenção preditiva com termografia periódica."
+    ),
+    "Falha mecânica": (
+        "Investigar causa raiz (desgaste, lubrificação, alinhamento) e considerar "
+        "manutenção preditiva (análise de vibração ou de óleo) nos pontos críticos."
+    ),
+    "Troca de ferramenta": (
+        "Aplicar SMED (Single-Minute Exchange of Die) para padronizar e reduzir o "
+        "tempo de troca de ferramenta/setup."
+    ),
+    "Falta de material": (
+        "Revisar o planejamento de abastecimento da linha (kanban, estoque mínimo "
+        "no posto, sincronização com o almoxarifado)."
+    ),
+    "Ajuste de setup": (
+        "Padronizar o procedimento de setup, treinar operadores e avaliar dispositivos "
+        "poka-yoke para reduzir ajustes recorrentes."
+    ),
+    "Manutenção preventiva": (
+        "Avaliar se a janela de manutenção preventiva está corretamente dimensionada "
+        "— pode estar consumindo mais tempo do que o necessário."
+    ),
+    "Outro": (
+        "Motivo pouco específico: oriente a equipe a detalhar melhor a causa no "
+        "formulário de paradas para permitir uma análise mais precisa."
+    ),
+}
+
+
 # ---------------------------------------------------------------------------
 # Conexão com o Google Sheets
 # ---------------------------------------------------------------------------
@@ -198,6 +232,107 @@ def calcular_oee(df_producao: pd.DataFrame, df_paradas: pd.DataFrame) -> pd.Data
 
 
 # ---------------------------------------------------------------------------
+# Painel de recomendações (regras de engenharia industrial sobre os dados)
+# ---------------------------------------------------------------------------
+
+# Benchmarks usuais de mercado para OEE (referência Lean/TPM)
+OEE_BENCHMARK_MUNDIAL = 0.85
+OEE_BENCHMARK_ACEITAVEL = 0.65
+
+
+def pareto_maquina_motivo(df_paradas: pd.DataFrame) -> pd.DataFrame:
+    """Ranking de combinações Máquina x Motivo pelo tempo total perdido."""
+    if df_paradas.empty:
+        return pd.DataFrame(
+            columns=["maquina", "motivo", "duracao_min", "acumulado_%", "rotulo"]
+        )
+    p = (
+        df_paradas.groupby(["maquina", "motivo"])["duracao_min"]
+        .sum()
+        .sort_values(ascending=False)
+        .reset_index()
+    )
+    p["acumulado_%"] = 100 * p["duracao_min"].cumsum() / p["duracao_min"].sum()
+    p["rotulo"] = p["maquina"] + " — " + p["motivo"]
+    return p
+
+
+def gerar_recomendacoes(df_oee: pd.DataFrame, df_paradas: pd.DataFrame, pareto_mm: pd.DataFrame):
+    """Gera uma lista de recomendações textuais priorizadas com base nos dados filtrados."""
+    recomendacoes = []
+
+    por_maquina_diag = (
+        df_oee.groupby("maquina")[["disponibilidade", "performance", "qualidade", "oee"]]
+        .mean()
+        .reset_index()
+    )
+
+    # 1) Diagnóstico por máquina: qual componente do OEE está puxando o resultado pra baixo
+    for _, row in por_maquina_diag.sort_values("oee").iterrows():
+        componentes = {
+            "Disponibilidade": row["disponibilidade"],
+            "Performance": row["performance"],
+            "Qualidade": row["qualidade"],
+        }
+        pior_componente = min(componentes, key=componentes.get)
+        valor_pior = componentes[pior_componente]
+
+        if row["oee"] >= OEE_BENCHMARK_MUNDIAL:
+            continue  # máquina já em nível de classe mundial, não precisa de alerta
+
+        severidade = "🔴 Crítico" if row["oee"] < OEE_BENCHMARK_ACEITAVEL else "🟡 Atenção"
+
+        if pior_componente == "Disponibilidade":
+            motivo_txt = (
+                "principalmente por tempo parado (não planejado) — veja o Pareto "
+                "abaixo para identificar a causa dominante nessa máquina."
+            )
+        elif pior_componente == "Performance":
+            motivo_txt = (
+                "a máquina está rodando abaixo do tempo de ciclo ideal — investigue "
+                "microparadas, desgaste de ferramenta ou velocidade reduzida por ajuste."
+            )
+        else:
+            motivo_txt = (
+                "o principal problema é refugo/qualidade — investigue causas de "
+                "processo (calibração, matéria-prima, parâmetros de máquina)."
+            )
+
+        recomendacoes.append(
+            {
+                "severidade": severidade,
+                "maquina": row["maquina"],
+                "oee": row["oee"],
+                "texto": (
+                    f"**{row['maquina']}** está com OEE de {row['oee']*100:.1f}%, "
+                    f"puxado por **{pior_componente}** ({valor_pior*100:.1f}%) — {motivo_txt}"
+                ),
+            }
+        )
+
+    # 2) Top itens do Pareto Máquina x Motivo (a "vital few" do princípio 80/20)
+    top_pareto = pareto_mm[pareto_mm["acumulado_%"] <= 80]
+    if top_pareto.empty and not pareto_mm.empty:
+        top_pareto = pareto_mm.head(1)  # garante ao menos 1 item mesmo se já ultrapassar 80% no 1º
+
+    for _, row in top_pareto.head(5).iterrows():
+        acao = MOTIVO_ACOES.get(row["motivo"], "Investigar a causa raiz desse tipo de parada.")
+        recomendacoes.append(
+            {
+                "severidade": "🎯 Prioridade (Pareto)",
+                "maquina": row["maquina"],
+                "oee": np.nan,
+                "texto": (
+                    f"**{row['maquina']} — {row['motivo']}** respondeu por "
+                    f"{row['duracao_min']:.0f} min perdidos no período. {acao}"
+                ),
+            }
+        )
+
+    return recomendacoes
+
+
+# ---------------------------------------------------------------------------
 # UI
 # ---------------------------------------------------------------------------
 
@@ -345,6 +480,55 @@ if not df_paradas_f.empty:
     st.plotly_chart(fig4, use_container_width=True)
 else:
     st.caption("Sem paradas registradas no período filtrado.")
+
+# --- Pareto de priorização Máquina x Motivo ("onde dedicar esforço") --------
+st.subheader("🎯 Priorização — Pareto Máquina x Motivo")
+st.caption(
+    "Ranking das combinações máquina/motivo que mais consomem tempo — os itens "
+    "destacados abaixo respondem por ~80% do tempo perdido (princípio de Pareto)."
+)
+pareto_mm = pareto_maquina_motivo(df_paradas_f)
+
+if not pareto_mm.empty:
+    top_n = pareto_mm.head(12)
+    fig5 = px.bar(
+        top_n,
+        x="rotulo",
+        y="duracao_min",
+        labels={"rotulo": "Máquina — Motivo", "duracao_min": "Minutos"},
+        color=(top_n["acumulado_%"] <= 80).map({True: "Foco prioritário (≤80%)", False: "Cauda longa"}),
+        color_discrete_map={"Foco prioritário (≤80%)": "#d62728", "Cauda longa": "#c9c9c9"},
+    )
+    fig5.add_scatter(
+        x=top_n["rotulo"],
+        y=top_n["acumulado_%"] * top_n["duracao_min"].max() / 100,
+        mode="lines+markers",
+        name="% acumulado",
+        yaxis="y2",
+    )
+    fig5.update_layout(
+        yaxis2=dict(overlaying="y", side="right", title="% acumulado", range=[0, 105]),
+        xaxis_tickangle=-35,
+        legend_title_text="",
+    )
+    st.plotly_chart(fig5, use_container_width=True)
+else:
+    st.caption("Sem paradas registradas no período filtrado.")
+
+# --- Painel de recomendações -------------------------------------------------
+st.subheader("💡 Painel de Recomendações")
+recomendacoes = gerar_recomendacoes(df_f, df_paradas_f, pareto_mm)
+
+if not recomendacoes:
+    st.success(
+        "Nenhuma recomendação crítica no momento — todas as máquinas estão em "
+        f"OEE acima do benchmark mundial ({OEE_BENCHMARK_MUNDIAL*100:.0f}%) no período filtrado."
+    )
+else:
+    for rec in recomendacoes:
+        with st.container(border=True):
+            st.markdown(f"{rec['severidade']} — {rec['texto']}")
+
 
 # --- Tabelas detalhadas -------------------------------------------------------
 with st.expander("Ver dados detalhados de produção/OEE"):
